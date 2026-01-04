@@ -126,6 +126,19 @@
 ### 👉**更新日志**
 
 <details close> 
+<summary> <b>2026-01-04 (Fork更新)</b> </summary>
+
+- 📝 全面注释代码：所有训练脚本、模型代码新增详细中文注释，方便学习理解
+- 🚀 支持50系显卡：新增 Blackwell 架构 (RTX 5090/5080) 完整支持，包括环境配置脚本和兼容性检测工具
+- 🔥 新增API蒸馏功能（实验性）：支持从 OpenRouter API 获取蒸馏数据，无需本地部署大模型
+  - `dataset/generate_distill_data_from_api.py`: 用户提供问题 → API生成答案
+  - `dataset/generate_qa_pairs_from_api.py`: API自动生成问题+答案
+  - 支持推理蒸馏模式（学习思维链）
+- 📚 新增文档：[环境配置指南](./docs/环境配置.md)、[API蒸馏训练指南](./docs/API蒸馏训练指南.md)
+
+</details>
+
+<details close> 
 <summary> <b>2025-10-24</b> </summary>
 
 - 🔥 新增RLAIF训练算法：PPO、GRPO、SPO（从0原生实现）
@@ -840,7 +853,7 @@ python train_distillation.py
 1️⃣ **用户提供问题 → API生成答案**（适合有现成数据）
 2️⃣ **API自己生成问题+答案**（适合从零开始）
 
-详见 [数据生成方式对比](./docs/数据生成方式对比.md)
+详见 [API蒸馏训练指南](./docs/API蒸馏训练指南.md)
 
 **快速开始:**
 

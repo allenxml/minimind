@@ -175,12 +175,12 @@ MiniMind2系列旧模型均经过权重映射+（微调训练）QKVO线性层校
 <details style="color:rgb(128,128,128)">
 <summary>分享本人的软硬件配置（仅供参考）</summary>
 
-* CPU: Intel(R) Core(TM) i9-10980XE CPU @ 3.00GHz
-* RAM: 128 GB
-* GPU: NVIDIA GeForce RTX 3090(24GB) * 8
-* Ubuntu==20.04
-* CUDA==12.2
-* Python==3.10.16
+* CPU: Intel(R) Core(TM) Ultra 9 275HX 
+* RAM: 64 GB
+* GPU: NVIDIA GeForce RTX 5090(24GB) 
+* WSL2 Ubuntu==22.04
+* CUDA==13.1
+* Python==3.10.12
 * [requirements.txt](./requirements.txt)
 
 </details>
@@ -188,7 +188,7 @@ MiniMind2系列旧模型均经过权重映射+（微调训练）QKVO线性层校
 ### 第0步
 
 ```bash
-git clone https://github.com/jingyaogong/minimind.git
+git clone https://github.com/allenxml/minimind.git
 ```
 
 ## Ⅰ 测试已有模型效果

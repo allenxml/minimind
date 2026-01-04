@@ -251,7 +251,7 @@ git clone https://huggingface.co/jingyaogong/MiniMind2 # or https://www.modelsco
 
 ```bash
 # Use transformers format model
-python eval_llm.py --load_from ./MiniMind2
+python scripts/eval_llm.py --load_from ./MiniMind2
 ```
 
 ### (Optional) Launch WebUI
@@ -362,7 +362,7 @@ Ensure the model `*.pth` files to be tested are in the `./out/` directory.
 You can also directly download and use the `*.pth` files I trained from [here](https://www.modelscope.cn/models/gongjy/MiniMind2-PyTorch/files).
 
 ```bash
-python eval_llm.py --weight full_sft # or pretrain/dpo/ppo/grpo...
+python scripts/eval_llm.py --weight full_sft # or pretrain/dpo/ppo/grpo...
 ```
 
 <details style="color:rgb(128,128,128)">
@@ -426,7 +426,7 @@ By adding the `--use_wandb` parameter, you can record the training process. Afte
 ## Ⅰ Tokenizer
 
 Tokenizer maps words from natural language to numbers like `0, 1, 36` through a "dictionary," which can be understood as numbers representing the page number of the word in the "dictionary."
-You can choose to construct your own vocabulary table to train a "dictionary." The code can be found in `./scripts/train_tokenizer.py` (for learning reference only. It's not necessary to train one yourself unless required. MiniMind comes with a built-in tokenizer).
+You can choose to construct your own vocabulary table to train a "dictionary." The code can be found in `./dataset/train_tokenizer.py` (for learning reference only. It's not necessary to train one yourself unless required. MiniMind comes with a built-in tokenizer).
 Or you can choose tokenizers from well-known open-source large models.
 Just as using Xinhua/Oxford dictionaries directly has the advantage of good token encoding compression, but the disadvantage of having too many pages—tens of thousands of word phrases;
 A self-trained tokenizer has the advantage of freely controlling vocabulary length and content, but the disadvantage of low compression ratio (for example, "hello" might be split into "h e l l o"
@@ -859,7 +859,7 @@ You can test the model through `eval_llm.py` for model evaluation.
 
 ```bash
 # Note: weight parameter specifies base model type, should match the base model used during train_lora training
-python eval_llm.py  --weight dpo --lora_weight lora_medical
+python scripts/eval_llm.py  --weight dpo --lora_weight lora_medical
 ```
 
 **Small Test**
@@ -1550,7 +1550,7 @@ MiniMind supports RoPE position encoding length extrapolation through YaRN algor
 When using `eval_llm.py` for inference, just add `--inference_rope_scaling` parameter to enable RoPE extrapolation:
 
 ```bash
-python eval_llm.py --weight full_sft --inference_rope_scaling
+python scripts/eval_llm.py --weight full_sft --inference_rope_scaling
 ```
 
 The chart below shows perplexity (PPL) comparison before and after RoPE scaling on different lengths of "Journey to the West" vernacular fiction text. You can see that after enabling RoPE scaling, model performance on long texts is significantly improved.

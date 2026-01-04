@@ -246,7 +246,7 @@ git clone https://huggingface.co/jingyaogong/MiniMind2 # or https://www.modelsco
 
 ```bash
 # 使用transformers格式模型
-python eval_llm.py --load_from ./MiniMind2
+python scripts/eval_llm.py --load_from ./MiniMind2
 ```
 
 ### （可选）启动WebUI
@@ -361,7 +361,7 @@ python train_full_sft.py
 也可以直接去[此处](https://www.modelscope.cn/models/gongjy/MiniMind2-PyTorch/files)下载使用我训练的`*.pth`文件。
 
 ```bash
-python eval_llm.py --weight full_sft # 或 pretrain/dpo/ppo/grpo...
+python scripts/eval_llm.py --weight full_sft # 或 pretrain/dpo/ppo/grpo...
 ```
 
 <details style="color:rgb(128,128,128)">
@@ -379,7 +379,7 @@ python eval_llm.py --weight full_sft # 或 pretrain/dpo/ppo/grpo...
 - `--top_p`: nucleus采样阈值（默认0.85）
 
 
-使用方式直接查看`eval_llm.py`代码即可。
+使用方式直接查看`scripts/eval_llm.py`代码即可。
 
 </details>
 
@@ -426,8 +426,8 @@ python train_xxx.py --use_wandb
 
 ## Ⅰ Tokenizer
 
-分词器将单词从自然语言通过“词典”映射到`0, 1, 36`这样的数字，可以理解为数字就代表了单词在“词典”中的页码。
-可以选择自己构造词表训练一个“词典”，代码可见`./scripts/train_tokenizer.py`（仅供学习参考，若非必要无需再自行训练，MiniMind已自带tokenizer）。
+分词器将单词从自然语言通过"词典"映射到`0, 1, 36`这样的数字，可以理解为数字就代表了单词在"词典"中的页码。
+可以选择自己构造词表训练一个"词典"，代码可见`./dataset/train_tokenizer.py`（仅供学习参考，若非必要无需再自行训练，MiniMind已自带tokenizer）。
 或者选择比较出名的开源大模型分词器，
 正如同直接用新华/牛津词典的优点是token编码压缩率很好，缺点是页数太多，动辄数十万个词汇短语；
 自己训练的分词器，优点是词表长度和内容随意控制，缺点是压缩率很低（例如"hello"也许会被拆分为"h e l l o"
@@ -826,6 +826,50 @@ torchrun --nproc_per_node 1 train_distillation.py
 python train_distillation.py
 ```
 
+#### **⭐ 新增: 从API进行知识蒸馏**
+
+现在支持从主流大模型API（如GPT-4、Claude、DeepSeek-R1等）进行知识蒸馏，无需本地部署大模型！
+
+**核心优势:**
+- ✅ 无需高端显卡，通过API访问顶级模型
+- ✅ 支持推理过程蒸馏（学习思维链）
+- ✅ 成本低廉（DeepSeek-R1约$7/万样本）
+
+**两种数据生成方式:**
+
+1️⃣ **用户提供问题 → API生成答案**（适合有现成数据）
+2️⃣ **API自己生成问题+答案**（适合从零开始）
+
+详见 [数据生成方式对比](./docs/数据生成方式对比.md)
+
+**快速开始:**
+
+```bash
+# 方式1: 用户提供问题 → API生成答案（推荐，有现成数据）
+python dataset/generate_distill_data_from_api.py \
+    --api_key YOUR_OPENROUTER_KEY \
+    --model anthropic/claude-opus-4.5 \
+    --input_file dataset/sft_mini_512.jsonl \
+    --output_file dataset/distill_opus45.jsonl \
+    --mode reasoning
+
+# 方式2: API自己生成问题+答案（从零开始）
+python dataset/generate_qa_pairs_from_api.py \
+    --api_key YOUR_OPENROUTER_KEY \
+    --model anthropic/claude-sonnet-4.5 \
+    --topic "Python编程基础" \
+    --num_samples 1000 \
+    --output_file dataset/qa_python_1000.jsonl
+
+# 训练（两种方式生成的数据格式相同）
+python trainer/train_distill_reason.py \
+    --data_path ../dataset/distill_opus45.jsonl \
+    --save_weight reason_opus45 \
+    --epochs 1
+```
+
+**详细文档:** 查看 [docs/API蒸馏训练指南.md](./docs/API蒸馏训练指南.md) 了解完整使用方法、成本估算和最佳实践。
+
 ### **4. LoRA (Low-Rank Adaptation)**
 
 LoRA是一种高效的参数高效微调（Parameter-Efficient Fine-Tuning, PEFT）方法，旨在通过低秩分解的方式对预训练模型进行微调。
@@ -868,7 +912,7 @@ python train_lora.py
 
 ```bash
 # 注意：weight参数指定基础模型类型，需与train_lora训练时使用的基础模型保持一致
-python eval_llm.py  --weight dpo --lora_weight lora_medical
+python scripts/eval_llm.py  --weight dpo --lora_weight lora_medical
 ```
 
 **小测试**
@@ -1583,7 +1627,7 @@ MiniMind支持通过YaRN算法进行RoPE位置编码的长度外推，使模型�
 在使用`eval_llm.py`进行推理时，只需添加`--inference_rope_scaling`参数即可启用RoPE外推：
 
 ```bash
-python eval_llm.py --weight full_sft --inference_rope_scaling
+python scripts/eval_llm.py --weight full_sft --inference_rope_scaling
 ```
 
 下图展示了在不同文本「西游记」白话文小说长度下，使用RoPE scaling前后的困惑度(PPL)对比。可以看出，启用RoPE scaling后，模型在长文本上的表现显著提升：

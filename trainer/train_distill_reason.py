@@ -1,7 +1,39 @@
+"""
+MiniMind 推理蒸馏训练脚本
+
+本脚本实现了推理能力的蒸馏训练，让小模型学习大模型的推理过程。
+
+推理蒸馏原理:
+- 使用大模型（如 DeepSeek-R1）生成的推理数据
+- 数据包含 <think>...</think> 和 <answer>...</answer> 标签
+- 小模型学习模仿大模型的思考过程和最终答案
+
+与普通 SFT 的区别:
+1. 数据格式: 包含思考过程标签
+2. 损失权重: 对特殊标签位置增加权重
+3. 目标: 不仅学习答案，还学习推理过程
+
+特殊标签:
+- <think>: 思考开始
+- </think>: 思考结束
+- <answer>: 答案开始
+- </answer>: 答案结束
+
+训练策略:
+- 对特殊标签位置增加 10 倍权重
+- 确保模型学会正确使用推理格式
+- 使用较小的学习率避免遗忘
+
+使用方法:
+    python train_distill_reason.py --epochs 1 --batch_size 8 --learning_rate 1e-6
+"""
+
 import os
 import sys
 
+# 设置包名以支持相对导入
 __package__ = "trainer"
+# 添加项目根目录到 Python 路径
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import argparse
@@ -17,113 +49,284 @@ from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
+# 忽略警告信息
 warnings.filterwarnings('ignore')
 
 
-def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=None):
-    # 思考标签占位符
+def train_epoch(epoch, loader, iters, tokenizer, lm_config, start_step=0, wandb=None, total_tokens=0):
+    """
+    训练一个 epoch（推理蒸馏版本）
+    
+    执行完整的推理蒸馏训练循环，包括:
+    1. 前向传播计算损失
+    2. 对特殊标签位置增加权重（推理蒸馏的关键特性）
+    3. 反向传播计算梯度
+    4. 梯度累积和参数更新
+    5. 日志记录和检查点保存
+    
+    Args:
+        epoch (int): 当前 epoch 索引
+        loader (DataLoader): 数据加载器
+        iters (int): 总迭代次数
+        tokenizer: 分词器（用于获取特殊标签的 token ID）
+        lm_config: 模型配置
+        start_step (int): 起始步数（用于断点续训）
+        wandb: wandb/swanlab 日志对象
+        total_tokens (int): 已处理的 token 总数
+        
+    Returns:
+        int: 更新后的 token 总数
+        
+    训练细节:
+    - 与普通 SFT 的关键区别: 对特殊标签位置增加 10 倍权重
+    - 特殊标签包括: <think>, </think>, <answer>, </answer>
+    - 这确保模型学会正确使用推理格式
+    - 使用交叉熵损失，通过加权 loss_mask 强调特殊标签
+    - 使用余弦退火学习率调度
+    - 支持梯度累积以模拟更大的批次
+    - 使用梯度裁剪防止梯度爆炸
+    """
+    # 获取思考标签的 token ID（用于识别特殊标签位置）
     start_of_think_ids = tokenizer('<think>').input_ids
     end_of_think_ids = tokenizer('</think>').input_ids
     start_of_answer_ids = tokenizer('<answer>').input_ids
     end_of_answer_ids = tokenizer('</answer>').input_ids
-    loss_fct = nn.CrossEntropyLoss(reduction='none')
-    start_time = time.time()
     
+    # 定义损失函数（不进行 reduction，以便应用加权 loss_mask）
+    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    
+    # 时间和速度统计
+    start_time = time.time()
+    last_log_time = start_time
+    last_log_tokens = total_tokens
+    last_log_step = start_step
+    
+    # 遍历数据批次
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+        # 将数据移动到 GPU
+        X = X.to(args.device)           # 输入 token ID
+        Y = Y.to(args.device)           # 目标 token ID
+        loss_mask = loss_mask.to(args.device)  # 损失掩码
+        
+        # 计算当前学习率（余弦退火）
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        # 前向传播（使用混合精度）
         with autocast_ctx:
             res = model(X)
+            
+            # 计算交叉熵损失
             loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),
-                Y.view(-1)
-            ).view(Y.size())
+                res.logits.view(-1, res.logits.size(-1)),  # (batch*seq, vocab)
+                Y.view(-1)                                   # (batch*seq,)
+            ).view(Y.size())  # 恢复形状 (batch, seq)
 
-            # 特殊标签位置增加权重（推理蒸馏特有）
-            sp_ids = torch.isin(Y.view(-1),
-                                torch.tensor(start_of_think_ids + end_of_think_ids
-                                             + start_of_answer_ids + end_of_answer_ids
-                                             ).to(args.device))
+            # ========== 推理蒸馏特有: 特殊标签位置增加权重 ==========
+            # 找到所有特殊标签的位置（用于增加权重）
+            sp_ids = torch.isin(
+                Y.view(-1),
+                torch.tensor(
+                    start_of_think_ids + end_of_think_ids + 
+                    start_of_answer_ids + end_of_answer_ids
+                ).to(args.device)
+            )
+            
+            # 保存原始 loss_mask 的和（用于归一化和 tokens 统计）
+            original_loss_mask = loss_mask.clone()  # 保存原始 mask 用于 tokens 统计
             loss_mask = loss_mask.view(-1)
             loss_mask_sum = loss_mask.sum()
-            loss_mask[sp_ids] = 10  # 对思考标签增加10倍权重
+            
+            # 对思考标签位置增加 10 倍权重
+            # 这确保模型学会正确使用推理格式（<think> 和 <answer> 标签）
+            loss_mask[sp_ids] = 10
+            
+            # 恢复形状并计算加权损失
             loss_mask = loss_mask.view(Y.size())
             loss = (loss * loss_mask).sum() / loss_mask_sum
+            
+            # 添加 MoE 辅助损失（如果使用 MoE）
             loss += res.aux_loss
+            
+            # 梯度累积：将损失除以累积步数
             loss = loss / args.accumulation_steps
 
+        # 反向传播（使用梯度缩放器处理混合精度）
         scaler.scale(loss).backward()
 
+        # 梯度累积完成后更新参数
         if (step + 1) % args.accumulation_steps == 0:
+            # 取消梯度缩放
             scaler.unscale_(optimizer)
+            
+            # 梯度裁剪（防止梯度爆炸）
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            
+            # 更新参数
             scaler.step(optimizer)
             scaler.update()
+            
+            # 清空梯度
             optimizer.zero_grad(set_to_none=True)
+            
+            # 清理 GPU 缓存
             torch.cuda.empty_cache()
 
+        # 统计本 step 的 token 数（使用原始 loss_mask 计算有效 token）
+        step_tokens = original_loss_mask.sum().item()
+        if dist.is_initialized():
+            # 分布式训练时乘以 GPU 数量
+            step_tokens *= dist.get_world_size()
+        total_tokens += step_tokens
+
+        # 日志记录
         if step % args.log_interval == 0 or step == iters - 1:
-            spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
+            now_time = time.time()
+            spend_time = now_time - start_time
+            current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
             
-            Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:')
+            # 计算速度: it/s 和 token/s（以两次日志之间的时间窗口为准）
+            interval_tokens = total_tokens - last_log_tokens
+            interval_time = max(now_time - last_log_time, 1e-6)
+            interval_steps = max(step - last_log_step, 1)
+            iter_per_sec = interval_steps / interval_time
+            tokens_per_sec = interval_tokens / interval_time
             
-            if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
+            # 更新日志时间点
+            last_log_time = now_time
+            last_log_tokens = total_tokens
+            last_log_step = step
+            
+            Logger(
+                f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) '
+                f'loss:{current_loss:.6f} lr:{current_lr:.12f} '
+                f'epoch_Time:{eta_min}min it/s:{iter_per_sec:.2f} '
+                f'token/s:{tokens_per_sec:.0f} total_tokens:{int(total_tokens)}'
+            )
+            
+            # 记录到 wandb
+            if wandb: 
+                wandb.log({
+                    "loss": current_loss,
+                    "lr": current_lr,
+                    "epoch_Time": eta_min,
+                    "it_per_sec": iter_per_sec,
+                    "tokens_per_sec": tokens_per_sec,
+                    "total_tokens": total_tokens
+                })
 
+        # 保存检查点
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
-            model.eval()
+            model.eval()  # 切换到评估模式
+            
+            # 构建检查点路径
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            
+            # 获取模型状态字典（处理 DDP 情况）
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
                 state_dict = model.state_dict()
-            state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
+            
+            # 半精度保存以节省空间
+            state_dict = {k: v.half() for k, v in state_dict.items()}
             torch.save(state_dict, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
-            model.train()
+            
+            # 保存完整检查点（包含优化器、scaler 等）
+            lm_checkpoint(
+                lm_config, 
+                weight=args.save_weight, 
+                model=model, 
+                optimizer=optimizer, 
+                scaler=scaler, 
+                epoch=epoch, 
+                step=step, 
+                wandb=wandb, 
+                save_dir='../checkpoints',
+                total_tokens=total_tokens
+            )
+            
+            model.train()  # 切换回训练模式
+    
+    return total_tokens
 
 
 if __name__ == "__main__":
+    # ========== 命令行参数解析 ==========
     parser = argparse.ArgumentParser(description="MiniMind Reasoning Distillation")
-    parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
-    parser.add_argument('--save_weight', default='reason', type=str, help="保存权重的前缀名")
-    parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=1e-6, help="初始学习率")
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
-    parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=1, help="数据加载线程数")
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
-    parser.add_argument("--save_interval", type=int, default=100, help="模型保存间隔")
-    parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
-    parser.add_argument('--max_seq_len', default=1024, type=int, help="训练的最大截断长度")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument("--data_path", type=str, default="../dataset/r1_mix_1024.jsonl", help="推理蒸馏数据路径")
-    parser.add_argument('--from_weight', default='dpo', type=str, help="基于哪个权重训练，默认dpo")
-    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
-    parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Reasoning", help="wandb项目名")
+    
+    # 保存相关参数
+    parser.add_argument("--save_dir", type=str, default="../out", 
+                        help="模型保存目录")
+    parser.add_argument('--save_weight', default='reason', type=str, 
+                        help="保存权重的前缀名")
+    
+    # 训练超参数
+    parser.add_argument("--epochs", type=int, default=1, 
+                        help="训练轮数")
+    parser.add_argument("--batch_size", type=int, default=8, 
+                        help="batch size")
+    parser.add_argument("--learning_rate", type=float, default=1e-6, 
+                        help="初始学习率")
+    parser.add_argument("--device", type=str, 
+                        default="cuda:0" if torch.cuda.is_available() else "cpu", 
+                        help="训练设备")
+    parser.add_argument("--dtype", type=str, default="bfloat16", 
+                        help="混合精度类型")
+    parser.add_argument("--num_workers", type=int, default=1, 
+                        help="数据加载线程数")
+    parser.add_argument("--accumulation_steps", type=int, default=1, 
+                        help="梯度累积步数")
+    parser.add_argument("--grad_clip", type=float, default=1.0, 
+                        help="梯度裁剪阈值")
+    parser.add_argument("--log_interval", type=int, default=100, 
+                        help="日志打印间隔")
+    parser.add_argument("--save_interval", type=int, default=100, 
+                        help="模型保存间隔")
+    
+    # 模型架构参数
+    parser.add_argument('--hidden_size', default=512, type=int, 
+                        help="隐藏层维度")
+    parser.add_argument('--num_hidden_layers', default=8, type=int, 
+                        help="隐藏层数量")
+    parser.add_argument('--max_seq_len', default=1024, type=int, 
+                        help="训练的最大截断长度")
+    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], 
+                        help="是否使用MoE架构（0=否，1=是）")
+    
+    # 数据和权重参数
+    parser.add_argument("--data_path", type=str, default="../dataset/r1_mix_1024.jsonl", 
+                        help="推理蒸馏数据路径")
+    parser.add_argument('--from_weight', default='dpo', type=str, 
+                        help="基于哪个权重训练，默认dpo")
+    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], 
+                        help="是否自动检测&续训（0=否，1=是）")
+    
+    # 日志参数
+    parser.add_argument("--use_wandb", action="store_true", 
+                        help="是否使用wandb")
+    parser.add_argument("--wandb_project", type=str, default="MiniMind-Reasoning", 
+                        help="wandb项目名")
+    
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized(): 
+        args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    lm_config = MiniMindConfig(
+        hidden_size=args.hidden_size, 
+        num_hidden_layers=args.num_hidden_layers, 
+        use_moe=bool(args.use_moe)
+    )
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -131,7 +334,7 @@ if __name__ == "__main__":
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
-    # ========== 4. 配wandb ==========
+    # ========== 4. 配置 wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
@@ -141,34 +344,65 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    # 使用绝对路径避免 HuggingFace 路径验证问题
+    tokenizer_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'model')
+    
+    # 初始化模型和 tokenizer（基于 DPO 权重）
+    model, tokenizer = init_model(lm_config, args.from_weight, tokenizer_path=tokenizer_path, save_dir=args.save_dir, device=args.device)
+    
+    # 创建推理蒸馏数据集
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    
+    # 创建分布式采样器
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    
+    # 创建梯度缩放器（用于混合精度训练）
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    
+    # 创建优化器
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
-    # ========== 6. 从ckp恢复状态 ==========
+    # ========== 6. 从 ckp 恢复状态 ==========
     start_epoch, start_step = 0, 0
+    total_tokens = 0
     if ckp_data:
+        # 恢复模型权重
         model.load_state_dict(ckp_data['model'])
+        # 恢复优化器状态
         optimizer.load_state_dict(ckp_data['optimizer'])
+        # 恢复梯度缩放器状态
         scaler.load_state_dict(ckp_data['scaler'])
+        # 恢复训练进度
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
+        total_tokens = ckp_data.get('total_tokens', 0)
     
-    # ========== 7. DDP包模型 ==========
+    # ========== 7. DDP 包装模型 ==========
     if dist.is_initialized():
+        # 忽略 RoPE 的 buffer（不需要同步）
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
+        # 使用 DDP 包装模型
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
+        # 设置分布式采样器的 epoch（确保每个 epoch 的数据顺序不同）
         train_sampler and train_sampler.set_epoch(epoch)
-        if epoch == start_epoch and start_step > 0: # 第一个epoch且存在检查点
+        
+        if epoch == start_epoch and start_step > 0:
+            # 第一个 epoch 且存在检查点：跳过已训练的步数
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
             loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + start_step + 1, tokenizer, lm_config, start_step, wandb)
-        else: # 默认从头开始
-            loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
-            train_epoch(epoch, loader, len(loader), tokenizer, lm_config, 0, wandb)
+            total_tokens = train_epoch(epoch, loader, len(loader) + start_step + 1, tokenizer, lm_config, start_step, wandb, total_tokens)
+        else:
+            # 默认从头开始
+            loader = DataLoader(
+                train_ds, 
+                batch_size=args.batch_size, 
+                shuffle=(train_sampler is None), 
+                sampler=train_sampler, 
+                num_workers=args.num_workers, 
+                pin_memory=True
+            )
+            total_tokens = train_epoch(epoch, loader, len(loader), tokenizer, lm_config, 0, wandb, total_tokens)

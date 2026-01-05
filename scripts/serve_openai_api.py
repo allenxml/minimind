@@ -28,7 +28,9 @@ def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     if 'model' in args.load_from:
         moe_suffix = '_moe' if args.use_moe else ''
-        ckp = f'../{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
+        # 处理绝对路径和相对路径
+        save_dir = args.save_dir if os.path.isabs(args.save_dir) else f'../{args.save_dir}'
+        ckp = f'{save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model = MiniMindForCausalLM(MiniMindConfig(
             hidden_size=args.hidden_size,
             num_hidden_layers=args.num_hidden_layers,
@@ -39,7 +41,8 @@ def init_model(args):
         model.load_state_dict(torch.load(ckp, map_location=device), strict=True)
         if args.lora_weight != 'None':
             apply_lora(model)
-            load_lora(model, f'../{args.save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth')
+            lora_path = f'{save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth'
+            load_lora(model, lora_path)
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     print(f'MiniMind模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)')

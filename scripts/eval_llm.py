@@ -103,7 +103,9 @@ def init_model(args):
         
         # 构建权重文件路径
         moe_suffix = '_moe' if args.use_moe else ''
-        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
+        # 处理绝对路径和相对路径
+        save_dir = args.save_dir if os.path.isabs(args.save_dir) else f'./{args.save_dir}'
+        ckp = f'{save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         
         # 加载模型权重
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
@@ -113,7 +115,8 @@ def init_model(args):
             # 先应用 LoRA 结构
             apply_lora(model)
             # 再加载 LoRA 权重
-            load_lora(model, f'./{args.save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth')
+            lora_path = f'{save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth'
+            load_lora(model, lora_path)
     else:
         # ========== 加载 HuggingFace 格式 ==========
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
